@@ -1,0 +1,13 @@
+{
+  "domain": "bhkw",
+  "name": "Dachs Senertec Modbus Read and Write",
+  "codeowners": [
+    "@creamtv"
+  ],
+  "version": "0.1.0",
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://www.home-assistant.io/integrations/pv",
+  "homekit": {},
+  "iot_class": "local_polling"
+}
