@@ -16,7 +16,7 @@ from .const_bhkw import (
     CONF_GLT_HEARTBEAT_INTERVAL,
     DEFAULT_GLT_HEARTBEAT_INTERVAL,
 )
-from .client import DachsClient
+from .coordinator import _DachsClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     store["hb_enabled"] = True
     store["glt_pin"] = pin
 
-    client = DachsClient(host, port, unit)
+    client = _DachsClient(host, port, unit)
     store["client"] = client
 
     async def _heartbeat_cb(_now) -> None:

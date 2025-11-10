@@ -1,137 +1,49 @@
-from __future__ import annotations
-
-import time
+# ------------- Lightweight sync client (per-key reads) -------------
+from datetime import timedelta
+from custom_components.bhkw.const_bhkw import ENUM_MAPS, READ_REGS
+from custom_components.bhkw.descriptions import DachsDesc
+from custom_components.bhkw.helper.processing import _combine, _scale
+from custom_components.bhkw.helper.reading import _fc4_read
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
 
-from datetime import timedelta  # kept if HA references this elsewhere
 
 from pymodbus.client import ModbusTcpClient
-from pymodbus.exceptions import ModbusException
 
-from homeassistant.core import HomeAssistant  # kept for HA context
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const_bhkw import (
-    DOMAIN,
-    READ_REGS,
-    ENUM_MAPS,  # <- mirror your utility
-    CONF_GLT_PIN,  # if you wire PIN in via HA config
+import socket
+from typing import Any, Dict, List
+
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
 )
 
-# If you prefer a fixed address:
-ADDR_GLT_HEARTBEAT = 8300  # TODO: set to your PDF's GLT PIN write register
+from custom_components.bhkw.const_bhkw import WRITE_REGS
 
 _LOGGER = logging.getLogger(__name__)
 
-# ---- decoding helpers mirrored from your working script ----
 
-SCALE_MAP: Dict[str, int] = {
-    "FIX0": 1,
-    "FIX1": 10,
-    "FIX2": 100,
-    "FIX3": 1000,
-    "FIX4": 10000,
-    "TEMP": 10,
-}
-SIGNED_TYPES = {"S16", "S32", "S64"}
+class _DachsClient:
+    """Simple persistent Modbus-TCP client tailored for Dachs GLT (FC=04)."""
 
-
-def _combine_words(words: Sequence[int], signed: bool) -> int:
-    value = 0
-    for word in words:
-        value = (value << 16) | (word & 0xFFFF)
-    if signed:
-        bits = len(words) * 16
-        value = _twos_complement(value, bits)
-    return value
-
-
-def _twos_complement(value: int, bits: int) -> int:
-    sign_bit = 1 << (bits - 1)
-    mask = (1 << bits) - 1
-    value &= mask
-    if value & sign_bit:
-        return value - (1 << bits)
-    return value
-
-
-def _decode_register(definition: Dict[str, Any], registers: Sequence[int]) -> Any:
-    if not registers:
-        raise ValueError(f"No data returned for register {definition['ref']}")
-
-    reg_type = definition["type"]
-    fmt = definition["fmt"]
-
-    if fmt == "RAW":
-        return list(registers)
-
-    if len(registers) == 1:
-        value = registers[0]
-    else:
-        value = _combine_words(registers, signed=reg_type in SIGNED_TYPES)
-
-    if reg_type in SIGNED_TYPES and len(registers) == 1:
-        value = _twos_complement(value, bits=16)
-
-    if fmt == "ENUM":
-        return value
-    if fmt in SCALE_MAP:
-        return value / SCALE_MAP[fmt]
-    if fmt == "DT":
-        # pass-through; caller can interpret as timestamp if desired
-        return value
-
-    return value
-
-
-def _apply_enum_label(key: str, value: Any) -> Any:
-    mapping = ENUM_MAPS.get(key)
-    if not mapping:
-        return value
-    try:
-        return {"raw": int(value), "label": mapping.get(int(value))}
-    except Exception:
-        return value
-
-
-# ---- Modbus client using "fetch many" (one call per spec) ----
-
-
-class SMAModbusClient:
-    """Sync client used in HA executor, using 'fetch many' per key."""
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        unit_id: int,
-        glt_pin: str | None = None,
-        timeout: float = 5.0,
-        polite_delay_s: float = 0.02,
-    ) -> None:
+    def __init__(self, host: str, port: int, unit_id: int) -> None:
         self._host = host
         self._port = port
         self._unit_id = unit_id
-        self._timeout = timeout
-        self._polite_delay_s = polite_delay_s
         self._client: ModbusTcpClient | None = None
-        self._glt_pin = (glt_pin or "").strip()
-        self._last_hb = 0.0
-        self._hb_interval_s = 10.0  # throttle heartbeat to at most once each 10s
-
-    # --- connection mgmt ---
 
     def _conn(self) -> ModbusTcpClient:
         if self._client is None:
-            self._client = ModbusTcpClient(
-                host=self._host,
-                port=self._port,
-                timeout=self._timeout,
+            cli = ModbusTcpClient(
+                host=self._host, port=self._port, timeout=5.0, retries=1
             )
-            if not self._client.connect():
+            if not cli.connect():
                 raise ConnectionError(f"Cannot connect to {self._host}:{self._port}")
+            self._client = cli
         return self._client
 
     def close(self) -> None:
@@ -141,63 +53,133 @@ class SMAModbusClient:
             finally:
                 self._client = None
 
-    # --- GLT heartbeat ---
-
-    def _send_heartbeat(self) -> None:
-        """Write the GLT PIN as heartbeat (FC=06). Safe/no-op if no PIN."""
-        if not self._glt_pin or not self._glt_pin.isdigit():
-            return
-        now = time.monotonic()
-        if now - self._last_hb < self._hb_interval_s:
-            return  # throttle
+     def write_glt_pin(self, pin_value: int) -> None:
+        """Heartbeat: schreibe GLT-PIN (FC=06) an 0x8300."""
         cli = self._conn()
-        pin_val = int(self._glt_pin)
         rr = cli.write_register(
-            address=ADDR_GLT_HEARTBEAT,
-            value=pin_val,
-            slave=self._unit_id,  # mirrors your working utility
+            address=ADDR_GLT_HEARTBEAT, value=int(pin_value), slave=self._unit
         )
-        # Don't raise on HB failures; just log and continue
         if rr and not rr.isError():
-            self._last_hb = now
+            _log_hb(self._host, self._unit, int(pin_value), True)
         else:
-            _LOGGER.debug("Heartbeat write failed or not acknowledged: %s", rr)
+            _log_hb(self._host, self._unit, int(pin_value), False, Exception(str(rr)))
 
-    # --- fetch-many reads ---
 
-    def _fetch_key(self, key: str) -> Any:
-        """Read and decode one key using FC=4."""
-        spec = READ_REGS[key]
-        cli = self._conn()
-        resp = cli.read_input_registers(
-            address=spec["ref"],
-            count=spec["cnt"],
-            slave=self._unit_id,  # stays consistent with your working code
-        )
-        if not resp or resp.isError():
-            raise ModbusException(
-                f"FC4 read failed @{spec['ref']} len {spec['cnt']}: {resp}"
-            )
-        decoded = _decode_register(spec, resp.registers)
-        return _apply_enum_label(key, decoded)
+    def read_keys(self, keys: List[str]) -> Dict[str, object]:
+        """Read a set of Dachs READ_REGS keys using *individual* FC=04 requests."""
+        client = self._conn()
+        out: Dict[str, object] = {}
 
-    def read_many(self, keys: List[str]) -> Dict[str, Any]:
-        """
-        Fetch many by iterating the requested keys.
-        One FC=4 call per key (keeps logic identical to your proven utility).
-        """
-        # Heartbeat first (throttled)
-        try:
-            self._send_heartbeat()
-        except Exception as hb_err:  # keep reads going even if HB fails
-            _LOGGER.debug("Heartbeat error (ignored): %s", hb_err)
+        for k in keys:
+            spec = READ_REGS[k]
+            start, cnt, dtype, fmt = spec["ref"], spec["cnt"], spec["type"], spec["fmt"]
 
-        out: Dict[str, Any] = {}
-        for key in keys:
             try:
-                out[key] = self._fetch_key(key)
-            except Exception as exc:
-                _LOGGER.debug("Key '%s' read failed: %s", key, exc)
-                out[key] = None
-            time.sleep(self._polite_delay_s)  # polite pacing between requests
+                regs = _fc4_read(client, start, cnt, self._unit_id)
+            except (OSError, socket.error) as net_err:
+                # single reconnect attempt per key
+                _LOGGER.warning(
+                    "Dachs GLT socket issue (%s). Reconnecting once…", net_err
+                )
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                self._client = None
+                client = self._conn()
+                regs = _fc4_read(client, start, cnt, self._unit_id)
+
+            signed = dtype in ("S16", "S32")
+            raw = _combine(regs, signed)
+            out[k] = _scale(raw, fmt)
+
         return out
+
+
+# ------------- Coordinator -------------
+class DachsFastCoordinator(DataUpdateCoordinator[Dict[str, object]]):
+    def __init__(
+        self, hass: HomeAssistant, client: _DachsClient, keys: List[str], seconds: int
+    ) -> None:
+        super().__init__(
+            hass=hass,
+            logger=_LOGGER,
+            name="Dachs GLT Fast",
+            update_interval=timedelta(seconds=seconds),
+        )
+        self._client = client
+        self._keys = keys
+
+    async def _async_update_data(self) -> Dict[str, object]:
+        """Fetch new data from the Dachs GLT via Modbus."""
+        try:
+            data = await self.hass.async_add_executor_job(
+                self._client.read_keys, self._keys
+            )
+
+            # 🔹 Log the entire data dict for debugging / timing visibility
+            _LOGGER.debug("Dachs update OK: %s", data)
+
+            return data
+
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Dachs update failed: %s", err)
+            raise UpdateFailed(str(err)) from err
+
+
+class DachsSensor(CoordinatorEntity[DachsFastCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: DachsFastCoordinator,
+        description: DachsDesc,
+        device_info: DeviceInfo,
+    ) -> None:
+        CoordinatorEntity.__init__(self, coordinator)
+        SensorEntity.__init__(self)
+        self.entity_description = description
+        self._key = description.key
+        self._attr_unique_id = f"dachs_{self._key}"
+        self._attr_device_info = device_info
+
+    @property
+    def native_value(self) -> Any:
+        data = self.coordinator.data or {}
+        val = data.get(self._key)
+
+        # Generic enum -> label mapping
+        enum_map = ENUM_MAPS.get(self._key)
+        if enum_map is not None and val is not None:
+            try:
+                return enum_map.get(int(val), f"Unbekannt ({val})")
+            except (TypeError, ValueError):
+                return f"Unbekannt ({val})"
+
+        return val
+
+    def write_glt_pin(self, pin_value: int) -> None:
+        """Heartbeat: schreibe GLT-PIN (FC=06) an 0x8300."""
+        ADDR_GLT_HEARTBEAT = WRITE_REGS["glt_pin"]
+        cli = self._conn()
+        rr = cli.write_register(
+            address=ADDR_GLT_HEARTBEAT, value=int(pin_value), slave=self._unit
+        )
+        if rr and not rr.isError():
+            _LOGGER.info(
+                "✅ GLT heartbeat ok — host=%s slave=%s pin=%s",
+                self.host,
+                self.unit,
+                self.pin,
+            )
+        else:
+            _LOGGER.error(
+                "❌ GLT heartbeat fail — host=%s slave=%s pin=%s",
+                self.host,
+                self.unit,
+                self.pin,
+            )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self.async_write_ha_state()
