@@ -26,10 +26,6 @@ UPDATE_INTERVAL: Final = 60  # seconds
 MANUFACTURER: Final = "Senertec"
 INTEGRATION_NAME: Final = "Dachs Senertec Modbus Reader and Writer"
 
-CONF_INSIDE_TEMPS: Final = "Innentemperatursensoren"
-CONF_OUTSIDE_TEMP: Final = "Außentemperaturfühler"
-CONF_ACCUWEATHER: Final = "Accuweather Wetterdaten falls Außenfühler ausfällt"
-
 # ---------- Register definition ----------
 RegType = Literal["U16", "S16", "U32", "S32", "U64"]
 FmtType = Literal["FIX0", "FIX1", "FIX2", "FIX3", "FIX4", "TEMP", "DT", "ENUM", "RAW"]

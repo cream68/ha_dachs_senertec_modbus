@@ -5,7 +5,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
-from .const import (
+from .const_bhkw import (
     DOMAIN,
     make_device_info,
     CONF_HOST,

@@ -6,7 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import (
+from .const_bhkw import (
     DOMAIN,
     CONF_HOST,
     CONF_PORT,

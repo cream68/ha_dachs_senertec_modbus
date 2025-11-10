@@ -12,7 +12,7 @@ from homeassistant.helpers import (
     selector as sel,  # ← Klassen-Selectoren (sicher für voluptuous_serialize)
 )
 
-from .const import (
+from .const_bhkw import (
     ALL_READ_KEYS_STR,  # list[str]
     CONF_GLT_HEARTBEAT_INTERVAL,
     # GLT Heartbeat
