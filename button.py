@@ -14,6 +14,8 @@ from .const_bhkw import (
     DEFAULT_PORT,
     DEFAULT_UNIT_ID,
 )
+from .coordinator import _DachsClient
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,13 +48,20 @@ class _HeartbeatNowButton(ButtonEntity):
 
     async def async_press(self) -> None:
         store = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {})
-        client = store.get("client")
+        client: _DachsClient | None = store.get("client")
         pin = (store.get("glt_pin") or "").strip()
-        if not client or not pin:
+
+        if client is None or not pin:
             _LOGGER.warning("GLT heartbeat client or PIN not available")
             return
+        if not pin.isdigit():
+            _LOGGER.warning("GLT heartbeat PIN must be numeric; got '%s'", pin)
+            return
+
         try:
-            await self.hass.async_add_executor_job(client.write_glt_pin, int(pin))
+            await self.hass.async_add_executor_job(client.write_glt_pin, pin)
             _LOGGER.info("✅ Manual GLT heartbeat sent (PIN=%s)", pin)
+        except ValueError as err:
+            _LOGGER.warning("GLT heartbeat skipped: %s", err)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("❌ Manual GLT heartbeat failed: %s", err)

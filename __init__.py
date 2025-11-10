@@ -49,14 +49,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not cur_pin:
             return
         try:
-            await hass.async_add_executor_job(client.write_glt_pin, int(cur_pin))
+            await hass.async_add_executor_job(client.write_glt_pin, cur_pin)
+            _LOGGER.debug("GLT heartbeat successfull")
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("GLT heartbeat failed: %s", err)
 
     # schedule heartbeat
-    unsub_hb = async_track_time_interval(
-        hass, _heartbeat_cb, timedelta(seconds=hb_every_s)
-    )
+    unsub_hb = async_track_time_interval(hass, _heartbeat_cb, timedelta(seconds=5))
     entry.async_on_unload(unsub_hb)
     entry.async_on_unload(lambda: client.close())
 

@@ -27,8 +27,11 @@ from custom_components.bhkw.const_bhkw import WRITE_REGS
 _LOGGER = logging.getLogger(__name__)
 
 
+GLT_PIN_REGISTER = WRITE_REGS["glt_pin"]["ref"]
+
+
 class _DachsClient:
-    """Simple persistent Modbus-TCP client tailored for Dachs GLT (FC=04)."""
+    """Simple persistent Modbus-TCP client tailored for Dachs GLT (FC=04/06)."""
 
     def __init__(self, host: str, port: int, unit_id: int) -> None:
         self._host = host
@@ -39,7 +42,10 @@ class _DachsClient:
     def _conn(self) -> ModbusTcpClient:
         if self._client is None:
             cli = ModbusTcpClient(
-                host=self._host, port=self._port, timeout=5.0, retries=1
+                host=self._host,
+                port=self._port,
+                timeout=5.0,
+                retries=1,
             )
             if not cli.connect():
                 raise ConnectionError(f"Cannot connect to {self._host}:{self._port}")
@@ -53,17 +59,29 @@ class _DachsClient:
             finally:
                 self._client = None
 
-     def write_glt_pin(self, pin_value: int) -> None:
-        """Heartbeat: schreibe GLT-PIN (FC=06) an 0x8300."""
-        cli = self._conn()
-        rr = cli.write_register(
-            address=ADDR_GLT_HEARTBEAT, value=int(pin_value), slave=self._unit
-        )
-        if rr and not rr.isError():
-            _log_hb(self._host, self._unit, int(pin_value), True)
-        else:
-            _log_hb(self._host, self._unit, int(pin_value), False, Exception(str(rr)))
+    def _write_register(self, *, address: int, value: str | int):
+        """Write a single holding register with unit/slave fallback."""
+        client = self._conn()
+        try:
+            return client.write_register(
+                address=address, value=value, unit=self._unit_id
+            )
+        except TypeError:
+            return client.write_register(
+                address=address, value=value, slave=self._unit_id
+            )
 
+    def write_glt_pin(self, pin_value: str | int) -> None:
+        """Send the GLT heartbeat (FC=06) with the configured PIN."""
+        pin_str = str(pin_value).strip()
+        if not pin_str or not pin_str.isdigit():
+            raise ValueError("GLT PIN must be numeric before writing")
+
+        response = self._write_register(address=GLT_PIN_REGISTER, value=pin_str)
+        if (
+            not response or response.isError()
+        ):  # pragma: no cover - pymodbus handles ack
+            raise IOError(f"GLT heartbeat failed @ {GLT_PIN_REGISTER}: {response!s}")
 
     def read_keys(self, keys: List[str]) -> Dict[str, object]:
         """Read a set of Dachs READ_REGS keys using *individual* FC=04 requests."""
@@ -83,7 +101,7 @@ class _DachsClient:
                 )
                 try:
                     client.close()
-                except Exception:
+                except Exception:  # pragma: no cover - best effort cleanup
                     pass
                 self._client = None
                 client = self._conn()
@@ -157,28 +175,6 @@ class DachsSensor(CoordinatorEntity[DachsFastCoordinator], SensorEntity):
                 return f"Unbekannt ({val})"
 
         return val
-
-    def write_glt_pin(self, pin_value: int) -> None:
-        """Heartbeat: schreibe GLT-PIN (FC=06) an 0x8300."""
-        ADDR_GLT_HEARTBEAT = WRITE_REGS["glt_pin"]
-        cli = self._conn()
-        rr = cli.write_register(
-            address=ADDR_GLT_HEARTBEAT, value=int(pin_value), slave=self._unit
-        )
-        if rr and not rr.isError():
-            _LOGGER.info(
-                "✅ GLT heartbeat ok — host=%s slave=%s pin=%s",
-                self.host,
-                self.unit,
-                self.pin,
-            )
-        else:
-            _LOGGER.error(
-                "❌ GLT heartbeat fail — host=%s slave=%s pin=%s",
-                self.host,
-                self.unit,
-                self.pin,
-            )
 
     @callback
     def _handle_coordinator_update(self) -> None:
