@@ -33,11 +33,10 @@ FmtType = Literal["FIX0", "FIX1", "FIX2", "FIX3", "FIX4", "TEMP", "DT", "ENUM", 
 # ----- Dachs enum maps -----
 PLANT_STATUS_MAP = {
     0: "Aus",
-    1: "Startet",
+    1: "Standby",
     2: "Läuft",
-    3: "Stoppt",
-    4: "Störung",
-    5: "Wartung",
+    3: "Wartezustand",
+    4: "Fehler",
 }
 
 REQUEST_TYPE_MAP = {  # 8015 — Art der Anforderung

@@ -57,7 +57,7 @@ async def async_setup_entry(
 
 class _ElectricalSetpointNumber(NumberEntity):
     _attr_has_entity_name = True
-    _attr_name = "Electrical setpoint"
+    _attr_name = "Angeforderte elektrische Leistung"
     _attr_mode = NumberMode.BOX
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_native_step = STEP_SETPOINT_W
