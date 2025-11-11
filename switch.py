@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
+
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
-
-import logging
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const_bhkw import (
     DOMAIN,
@@ -29,18 +30,20 @@ async def async_setup_entry(
     port = int(data.get(CONF_PORT, DEFAULT_PORT))
     unit_id = int(data.get(CONF_UNIT_ID, DEFAULT_UNIT_ID))
 
-    # Ensure per-entry store exists (and a default heartbeat flag)
+    # Per-Entry-Store + Default-Zustand
     store = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
     store.setdefault("hb_enabled", True)
 
     device_info: DeviceInfo = make_device_info(entry.entry_id, host, port, unit_id)
-    async_add_entities([_NoopHeartbeatSwitch(hass, entry, device_info)], True)
+    async_add_entities(
+        [_NoopHeartbeatSwitch(hass, entry, device_info)], update_before_add=False
+    )
 
 
-class _NoopHeartbeatSwitch(SwitchEntity):
+class _NoopHeartbeatSwitch(SwitchEntity, RestoreEntity):
     _attr_has_entity_name = True
+    _attr_should_poll = False
     _attr_name = "GLT Heartbeat"
-    _attr_unique_id = "dachs_glt_heartbeat"
 
     def __init__(
         self, hass: HomeAssistant, entry: ConfigEntry, device_info: DeviceInfo
@@ -48,10 +51,24 @@ class _NoopHeartbeatSwitch(SwitchEntity):
         self.hass = hass
         self.entry = entry
         self._attr_device_info = device_info
+        # pro Entry eindeutig
+        self._attr_unique_id = f"{entry.entry_id}_dachs_glt_heartbeat"
+
+    async def async_added_to_hass(self) -> None:
+        """Vorherigen Zustand nach HA-Neustart wiederherstellen."""
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None:
+            restored = last.state == "on"
+            store = self.hass.data[DOMAIN][self.entry.entry_id]
+            if store.get("hb_enabled", True) != restored:
+                store["hb_enabled"] = restored
+                _LOGGER.info("Heartbeat restored to %s", "on" if restored else "off")
+        # direkt UI-Status schreiben
+        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:
-        # simple in-memory flag
         store = self.hass.data[DOMAIN][self.entry.entry_id]
         return bool(store.get("hb_enabled", True))
 

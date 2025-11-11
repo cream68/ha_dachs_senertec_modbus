@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.components.number import NumberEntity, NumberMode, NumberDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
@@ -24,11 +24,19 @@ from .coordinator import DachsClient  # <-- correct import
 
 _LOGGER = logging.getLogger(__name__)
 
+# interner Store-Schlüssel: wir speichern in **Watt**, UI zeigt **kW**
 SETPOINT_STORE_KEY = "electrical_setpoint_W"
-DEFAULT_SETPOINT_W = 0.0
+
+# Gerätegrenzen (W)
 MIN_SETPOINT_W = 0.0
-MAX_SETPOINT_W = 20000.0  # 20 kW max
-STEP_SETPOINT_W = 10.0  # device expects decawatt steps (10 W)
+MAX_SETPOINT_W = 5.5  # 20 kW
+STEP_W = 10.0  # 10 W Schritte
+# abgeleitet für UI (kW)
+MIN_KW = MIN_SETPOINT_W / 1000.0
+MAX_KW = MAX_SETPOINT_W / 1000.0
+STEP_KW = STEP_W / 1000.0
+
+DEFAULT_SETPOINT_W = 0.0
 
 
 async def async_setup_entry(
@@ -51,18 +59,21 @@ async def async_setup_entry(
 
     async_add_entities(
         [_ElectricalSetpointNumber(hass, entry, store, client, device_info)],
-        update_before_add=True,
+        update_before_add=False,
     )
 
 
 class _ElectricalSetpointNumber(NumberEntity):
+    """Setpoint in kW (UI), schreibt intern in W (raw)."""
+
     _attr_has_entity_name = True
     _attr_name = "Angeforderte elektrische Leistung"
     _attr_mode = NumberMode.BOX
-    _attr_native_unit_of_measurement = UnitOfPower.WATT
-    _attr_native_step = STEP_SETPOINT_W
-    _attr_native_min_value = MIN_SETPOINT_W
-    _attr_native_max_value = MAX_SETPOINT_W
+    _attr_device_class = NumberDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT  # UI in kW
+    _attr_native_step = STEP_KW
+    _attr_native_min_value = MIN_KW
+    _attr_native_max_value = MAX_KW
 
     def __init__(
         self,
@@ -79,76 +90,77 @@ class _ElectricalSetpointNumber(NumberEntity):
         self._attr_device_info = device_info
         self._attr_unique_id = f"{DOMAIN}:{entry.entry_id}:electrical_setpoint"
 
+        # initial aus Store (W) lesen → in kW darstellen
         initial_w = float(store.get(SETPOINT_STORE_KEY, DEFAULT_SETPOINT_W))
-        # Quantize to device step for a consistent starting value
-        initial_w = int(round(initial_w / STEP_SETPOINT_W)) * STEP_SETPOINT_W
-        self._attr_native_value = float(initial_w)
+        initial_w = int(round(initial_w / STEP_W)) * STEP_W  # auf 10 W quantisieren
+        self._attr_native_value = initial_w / 1000.0  # kW
 
-        # Cache register info for logging
-        self._setpoint_spec = WRITE_REGS.get(
-            "electrical_setpoint_W", {"ref": 8301, "fmt": "FIX-DAW"}
-        )
-        self._reg_addr = int(self._setpoint_spec.get("ref", 8301))
+        # nur für Logging
+        spec = WRITE_REGS.get("electrical_setpoint_W", {"ref": 8301, "fmt": "FIX-W"})
+        self._reg_addr = int(spec.get("ref", 8301))
+        self._fmt = str(spec.get("fmt", "FIX-W"))
 
     @property
     def native_value(self) -> float:
-        stored = self._store.get(SETPOINT_STORE_KEY, DEFAULT_SETPOINT_W)
+        """UI-Wert in kW (aus Store in W umgerechnet)."""
+        stored_w = self._store.get(SETPOINT_STORE_KEY, DEFAULT_SETPOINT_W)
         try:
-            return float(stored)
+            return float(stored_w) / 1000.0
         except (TypeError, ValueError):
-            return DEFAULT_SETPOINT_W
+            return DEFAULT_SETPOINT_W / 1000.0
 
-    async def async_set_native_value(self, value_w: float) -> None:
-        # 1) Clamp to allowed range
-        vmin = self.native_min_value or MIN_SETPOINT_W
-        vmax = self.native_max_value or MAX_SETPOINT_W
-        clamped_w = max(vmin, min(vmax, value_w))
+    async def async_set_native_value(self, value_kw: float) -> None:
+        """User setzt kW → clamp, quantize in **W**, dann schreiben."""
+        # 1) in W umrechnen
+        req_w = float(value_kw) * 1000.0
 
-        # 2) Quantize to 10 W steps (raw = decawatt)
-        raw = int(round(clamped_w / STEP_SETPOINT_W))  # decawatt
-        quantized_w = raw * int(STEP_SETPOINT_W)
+        # 2) auf Gerätegrenzen (in W) clampen
+        clamped_w = max(MIN_SETPOINT_W, min(MAX_SETPOINT_W, req_w))
 
-        # 3) Log exactly what we intend to send (both W and raw)
+        # 3) auf 10 W quantisieren
+        raw_w = int(round(clamped_w / STEP_W)) * int(STEP_W)  # ganzzahlig in W
+        quantized_kw = raw_w / 1000.0
+
         _LOGGER.info(
-            "Setpoint request: %.1f W → clamped %.1f W → quantized %.1f W (raw=%d decawatt) @ reg %s",
-            value_w,
+            "Setpoint request: %.3f kW (%.1f W) → clamped %.3f kW (%.1f W) → "
+            "quantized %.3f kW (raw=%d W) @ reg %s fmt=%s",
+            value_kw,
+            req_w,
+            clamped_w / 1000.0,
             clamped_w,
-            float(quantized_w),
-            raw,
+            quantized_kw,
+            raw_w,
             self._reg_addr,
+            self._fmt,
         )
 
         try:
-            # IMPORTANT:
-            # Our DachsClient.write_register_key() expects a logical value in W
-            # and will encode according to WRITE_REGS['electrical_setpoint_W']['fmt'].
-            # We pass the QUANTIZED watts to ensure raw is an integer.
+            # Client erwartet **logischen Wert in W**; Encoding übernimmt der Client gemäß fmt.
             await self.hass.async_add_executor_job(
                 self._client.write_register_key,
                 "electrical_setpoint_W",
-                float(quantized_w),
+                float(raw_w),  # <-- RAW IN W
             )
         except ValueError as err:
             raise HomeAssistantError(f"Invalid electrical setpoint: {err}") from err
         except Exception as err:  # noqa: BLE001
             _LOGGER.error(
-                "Failed to write electrical setpoint %.1f W (raw=%d) to reg %s: %s",
-                float(quantized_w),
-                raw,
+                "Failed to write electrical setpoint %.3f kW (raw=%d W) to reg %s: %s",
+                quantized_kw,
+                raw_w,
                 self._reg_addr,
                 err,
             )
             raise HomeAssistantError("Modbus write failed") from err
 
-        # 4) Confirm what was sent (again, shows raw)
         _LOGGER.info(
-            "Electrical setpoint written: %.1f W (raw=%d) → reg %s",
-            float(quantized_w),
-            raw,
+            "Electrical setpoint written: %.3f kW (raw=%d W) → reg %s",
+            quantized_kw,
+            raw_w,
             self._reg_addr,
         )
 
-        # 5) Persist and update state
-        self._store[SETPOINT_STORE_KEY] = float(quantized_w)
-        self._attr_native_value = float(quantized_w)
+        # 4) Persistiere in **W** und aktualisiere UI (kW)
+        self._store[SETPOINT_STORE_KEY] = float(raw_w)
+        self._attr_native_value = quantized_kw
         self.async_write_ha_state()
