@@ -1,181 +1,259 @@
-# ------------- Lightweight sync client (per-key reads) -------------
-from datetime import timedelta
-from custom_components.bhkw.const_bhkw import ENUM_MAPS, READ_REGS
-from custom_components.bhkw.descriptions import DachsDesc
-from custom_components.bhkw.helper.processing import _combine, _scale
-from custom_components.bhkw.helper.reading import _fc4_read
-import logging
+# custom_components/bhkw/client.py
+from __future__ import annotations
 
+import logging
+import socket
+import threading
+import time
+from typing import Dict, Iterable, List, Optional
 
 from pymodbus.client import ModbusTcpClient
 
+from .const_bhkw import READ_REGS, WRITE_REGS
+from .helper.reading import _fc4_read
+from .helper.processing import _combine, _scale, _encode_for_write
 
-import socket
-from typing import Any, Dict, List
-
-from homeassistant.components.sensor import SensorEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
-
-from custom_components.bhkw.const_bhkw import WRITE_REGS
+__all__ = ["DachsClient"]
 
 _LOGGER = logging.getLogger(__name__)
 
+# GLT heartbeat register (FC=06)
+_GLT_PIN_REG = WRITE_REGS["glt_pin"]["ref"]
 
-GLT_PIN_REGISTER = WRITE_REGS["glt_pin"]["ref"]
+# Retry/backoff for transient socket drops
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_SLEEP = 0.05  # seconds
+_PER_KEY_PAUSE = 0.02  # seconds between successive reads (be gentle)
 
 
-class _DachsClient:
-    """Simple persistent Modbus-TCP client tailored for Dachs GLT (FC=04/06)."""
+class DachsClient:
+    """
+    One persistent Modbus-TCP client for the Dachs GLT.
 
-    def __init__(self, host: str, port: int, unit_id: int) -> None:
+    - Reads use FC=04 (input registers) per GLT spec.
+    - Writes use FC=06 (single holding register) for PIN / setpoints.
+    - A single TCP connection is shared for all operations (guarded by a lock).
+    - On reconnect, the last-known heartbeat PIN is sent again automatically.
+
+    Public API:
+      set_fast_keys(keys)
+      set_slow_keys(keys)
+      get_fast_keys() -> dict
+      get_slow_keys() -> dict
+      heartbeat(pin: Optional[int] = None) -> None
+      write_register_key(key: str, logical_value: float | int) -> None
+      close() -> None
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        unit_id: int,
+        *,
+        fast_keys: Optional[Iterable[str]] = None,
+        slow_keys: Optional[Iterable[str]] = None,
+        timeout: float = 5.0,
+        retries: int = 1,
+        initial_pin: Optional[int] = None,
+    ) -> None:
         self._host = host
-        self._port = port
-        self._unit_id = unit_id
-        self._client: ModbusTcpClient | None = None
+        self._port = int(port)
+        self._unit_id = int(unit_id)
+        self._timeout = float(timeout)
+        self._retries = int(retries)
+
+        self._client: Optional[ModbusTcpClient] = None
+        self._lock = threading.RLock()
+
+        self._fast_keys = list(fast_keys or [])
+        self._slow_keys = list(slow_keys or [])
+        self._pin: Optional[int] = int(initial_pin) if initial_pin is not None else None
+
+    # ---------------------- connection helpers ----------------------
 
     def _conn(self) -> ModbusTcpClient:
+        """Ensure a connected Modbus client and return it."""
         if self._client is None:
             cli = ModbusTcpClient(
                 host=self._host,
                 port=self._port,
-                timeout=5.0,
-                retries=1,
+                timeout=self._timeout,
+                retries=self._retries,
             )
             if not cli.connect():
                 raise ConnectionError(f"Cannot connect to {self._host}:{self._port}")
             self._client = cli
+            _LOGGER.debug("Modbus TCP connected to %s:%s", self._host, self._port)
+            if self._pin is not None:
+                try:
+                    self._write_register(address=_GLT_PIN_REG, value=int(self._pin))
+                    _LOGGER.info(
+                        "Re-sent GLT heartbeat after connect (PIN=%s)", self._pin
+                    )
+                except Exception as err:
+                    _LOGGER.warning("Heartbeat after connect failed: %s", err)
         return self._client
 
-    def close(self) -> None:
+    def _reconnect_and_reheart(self) -> ModbusTcpClient:
+        """Reconnect the socket and, if known, re-send the GLT heartbeat PIN."""
         if self._client:
             try:
                 self._client.close()
+            except Exception:
+                pass
             finally:
                 self._client = None
 
-    def _write_register(self, *, address: int, value: str | int):
-        """Write a single holding register with unit/slave fallback."""
-        client = self._conn()
-        try:
-            return client.write_register(
-                address=address, value=value, unit=self._unit_id
-            )
-        except TypeError:
-            return client.write_register(
-                address=address, value=value, slave=self._unit_id
-            )
+        cli = self._conn()
 
-    def write_glt_pin(self, pin_value: str | int) -> None:
-        """Send the GLT heartbeat (FC=06) with the configured PIN."""
-        pin_str = str(pin_value).strip()
-        if not pin_str or not pin_str.isdigit():
-            raise ValueError("GLT PIN must be numeric before writing")
-
-        response = self._write_register(address=GLT_PIN_REGISTER, value=pin_str)
-        if (
-            not response or response.isError()
-        ):  # pragma: no cover - pymodbus handles ack
-            raise IOError(f"GLT heartbeat failed @ {GLT_PIN_REGISTER}: {response!s}")
-
-    def read_keys(self, keys: List[str]) -> Dict[str, object]:
-        """Read a set of Dachs READ_REGS keys using *individual* FC=04 requests."""
-        client = self._conn()
-        out: Dict[str, object] = {}
-
-        for k in keys:
-            spec = READ_REGS[k]
-            start, cnt, dtype, fmt = spec["ref"], spec["cnt"], spec["type"], spec["fmt"]
-
+        if self._pin is not None:
             try:
-                regs = _fc4_read(client, start, cnt, self._unit_id)
-            except (OSError, socket.error) as net_err:
-                # single reconnect attempt per key
-                _LOGGER.warning(
-                    "Dachs GLT socket issue (%s). Reconnecting once…", net_err
+                self._write_register(address=_GLT_PIN_REG, value=int(self._pin))
+                _LOGGER.info(
+                    "Re-sent GLT heartbeat after reconnect (PIN=%s)", self._pin
                 )
-                try:
-                    client.close()
-                except Exception:  # pragma: no cover - best effort cleanup
-                    pass
-                self._client = None
-                client = self._conn()
-                regs = _fc4_read(client, start, cnt, self._unit_id)
+            except Exception as err:
+                _LOGGER.warning("Heartbeat after reconnect failed: %s", err)
+        return cli
 
+    # ---------------------- low-level read/write ----------------------
+
+    def _write_register(self, *, address: int, value: int | str):
+        """
+        FC=06 write with unit/slave compatibility and response validation.
+        Accepts int-like strings; validates Modbus response.
+        """
+        cli = self._conn()
+        v = int(value)
+
+        try:
+            _LOGGER.debug(
+                "Writing %s to address %s (unit=%s)", v, address, self._unit_id
+            )
+            rr = cli.write_register(address=address, value=v, unit=self._unit_id)
+        except TypeError:
+            # Older pymodbus versions use 'slave' instead of 'unit'
+            _LOGGER.debug(
+                "Writing %s to address %s (slave=%s)", v, address, self._unit_id
+            )
+            rr = cli.write_register(address=address, value=v, slave=self._unit_id)
+
+        if not rr:
+            raise IOError(f"No response writing @{address}")
+        if rr.isError():
+            raise IOError(f"FC6 write failed @{address}: {rr}")
+        return rr
+
+    def _read_keys_once(
+        self, cli: ModbusTcpClient, keys: List[str]
+    ) -> Dict[str, object]:
+        """One pass of FC=04 key reads (no reconnect here)."""
+        out: Dict[str, object] = {}
+        for key in keys:
+            spec = READ_REGS[key]
+            addr, cnt, dtype, fmt = spec["ref"], spec["cnt"], spec["type"], spec["fmt"]
+
+            regs = _fc4_read(cli, addr, cnt, self._unit_id)  # raises on error
             signed = dtype in ("S16", "S32")
             raw = _combine(regs, signed)
-            out[k] = _scale(raw, fmt)
+            out[key] = _scale(raw, fmt)
 
+            time.sleep(_PER_KEY_PAUSE)
         return out
 
+    def _read_keys(self, keys: List[str]) -> Dict[str, object]:
+        """
+        Read keys with retry + reconnect. If reconnect happens, we re-heartbeat first.
+        Entire operation is serialized by a lock so reads/writes never collide.
+        """
+        if not keys:
+            return {}
 
-# ------------- Coordinator -------------
-class DachsFastCoordinator(DataUpdateCoordinator[Dict[str, object]]):
-    def __init__(
-        self, hass: HomeAssistant, client: _DachsClient, keys: List[str], seconds: int
-    ) -> None:
-        super().__init__(
-            hass=hass,
-            logger=_LOGGER,
-            name="Dachs GLT Fast",
-            update_interval=timedelta(seconds=seconds),
-        )
-        self._client = client
-        self._keys = keys
+        with self._lock:
+            cli = self._conn()
+            attempt = 0
+            while True:
+                try:
+                    return self._read_keys_once(cli, keys)
+                except (OSError, socket.error, IOError) as err:
+                    attempt += 1
+                    if attempt > _RETRY_ATTEMPTS:
+                        _LOGGER.error(
+                            "Read keys failed after %s attempts: %s",
+                            _RETRY_ATTEMPTS,
+                            err,
+                        )
+                        raise
+                    _LOGGER.warning(
+                        "Socket/read issue (%s). Reconnecting (try %s/%s)…",
+                        err,
+                        attempt,
+                        _RETRY_ATTEMPTS,
+                    )
+                    cli = self._reconnect_and_reheart()
+                    time.sleep(_RETRY_BASE_SLEEP * attempt * attempt)
 
-    async def _async_update_data(self) -> Dict[str, object]:
-        """Fetch new data from the Dachs GLT via Modbus."""
-        try:
-            data = await self.hass.async_add_executor_job(
-                self._client.read_keys, self._keys
-            )
+    # ------------------------- public API -------------------------
 
-            # 🔹 Log the entire data dict for debugging / timing visibility
-            _LOGGER.debug("Dachs update OK: %s", data)
+    def set_fast_keys(self, keys: Iterable[str]) -> None:
+        self._fast_keys = list(keys or [])
 
-            return data
+    def set_slow_keys(self, keys: Iterable[str]) -> None:
+        self._slow_keys = list(keys or [])
 
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Dachs update failed: %s", err)
-            raise UpdateFailed(str(err)) from err
+    def get_fast_keys(self) -> Dict[str, object]:
+        """Read the configured 'fast' keys through the persistent connection."""
+        return self._read_keys(self._fast_keys)
 
+    def get_slow_keys(self) -> Dict[str, object]:
+        """Read the configured 'slow' keys through the persistent connection."""
+        return self._read_keys(self._slow_keys)
 
-class DachsSensor(CoordinatorEntity[DachsFastCoordinator], SensorEntity):
-    _attr_has_entity_name = True
+    def heartbeat(self, pin: Optional[int] = None) -> None:
+        """
+        Send/refresh the GLT heartbeat (FC=06). If 'pin' is provided, remember it and
+        use it after future reconnects. Serialized via the same lock as reads.
+        """
+        with self._lock:
+            if pin is not None:
+                self._pin = int(pin)
 
-    def __init__(
-        self,
-        coordinator: DachsFastCoordinator,
-        description: DachsDesc,
-        device_info: DeviceInfo,
-    ) -> None:
-        CoordinatorEntity.__init__(self, coordinator)
-        SensorEntity.__init__(self)
-        self.entity_description = description
-        self._key = description.key
-        self._attr_unique_id = f"dachs_{self._key}"
-        self._attr_device_info = device_info
+            if self._pin is None:
+                raise ValueError("GLT PIN not set for heartbeat()")
 
-    @property
-    def native_value(self) -> Any:
-        data = self.coordinator.data or {}
-        val = data.get(self._key)
-
-        # Generic enum -> label mapping
-        enum_map = ENUM_MAPS.get(self._key)
-        if enum_map is not None and val is not None:
             try:
-                return enum_map.get(int(val), f"Unbekannt ({val})")
-            except (TypeError, ValueError):
-                return f"Unbekannt ({val})"
+                self._write_register(address=_GLT_PIN_REG, value=int(self._pin))
+                _LOGGER.info("GLT heartbeat sent (PIN=%s)", self._pin)
+            except (OSError, socket.error, IOError) as err:
+                _LOGGER.warning("Heartbeat failed (%s). Reconnecting + retry…", err)
+                self._reconnect_and_reheart()
+                self._write_register(address=_GLT_PIN_REG, value=int(self._pin))
+                _LOGGER.info("GLT heartbeat sent after reconnect (PIN=%s)", self._pin)
 
-        return val
+    def write_register_key(self, key: str, logical_value: float | int) -> None:
+        """
+        Generic FC=06 writer using WRITE_REGS spec and _encode_for_write().
+        Example: electrical setpoint in W -> encodes to decawatt etc. per 'fmt'.
+        Retries once after reconnect + re-heartbeat on socket error.
+        """
+        spec = WRITE_REGS[key]
+        raw_value = _encode_for_write(logical_value, spec["fmt"])
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        self.async_write_ha_state()
+        with self._lock:
+            try:
+                self._write_register(address=spec["ref"], value=raw_value)
+            except (OSError, socket.error, IOError):
+                self._reconnect_and_reheart()
+                self._write_register(address=spec["ref"], value=raw_value)
+
+    def close(self) -> None:
+        """Close the TCP socket (e.g., on HA unload)."""
+        with self._lock:
+            if self._client:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                finally:
+                    self._client = None

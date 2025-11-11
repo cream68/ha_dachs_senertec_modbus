@@ -6,6 +6,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 
+import logging
+
 from .const_bhkw import (
     DOMAIN,
     CONF_HOST,
@@ -15,6 +17,8 @@ from .const_bhkw import (
     DEFAULT_UNIT_ID,
     make_device_info,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -53,8 +57,10 @@ class _NoopHeartbeatSwitch(SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         self.hass.data[DOMAIN][self.entry.entry_id]["hb_enabled"] = True
+        _LOGGER.info("Heartbeat turned on")
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self.hass.data[DOMAIN][self.entry.entry_id]["hb_enabled"] = False
+        _LOGGER.info("Heartbeat turned off")
         self.async_write_ha_state()

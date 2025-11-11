@@ -47,3 +47,20 @@ def _scale(value: int, fmt: str) -> float | int:
     if f == "TEMP":
         return round(value / 10.0, 1)
     return value
+
+
+def _encode_for_write(value: float | int, fmt: str) -> int:
+    """Inverse of _scale for Modbus write paths."""
+    f = (fmt or "RAW").strip().upper()
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"Invalid numeric value '{value}' for fmt '{fmt}'") from err
+
+    if f.startswith("FIX"):
+        digits = "".join(ch for ch in f[3:] if ch.isdigit())
+        p = int(digits) if digits else 0
+        return int(round(numeric * (10**p)))
+    if f == "TEMP":
+        return int(round(numeric * 10))
+    return int(round(numeric))

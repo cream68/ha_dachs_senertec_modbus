@@ -16,11 +16,11 @@ from .const_bhkw import (
     CONF_GLT_HEARTBEAT_INTERVAL,
     DEFAULT_GLT_HEARTBEAT_INTERVAL,
 )
-from .coordinator import _DachsClient
+from custom_components.bhkw.coordinator import DachsClient
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[str] = ["sensor", "switch", "button"]
+PLATFORMS: list[str] = ["sensor", "switch", "button", "number"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -39,25 +39,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     store["hb_enabled"] = True
     store["glt_pin"] = pin
 
-    client = _DachsClient(host, port, unit)
+    client = DachsClient(host, port, unit)
     store["client"] = client
 
     async def _heartbeat_cb(_now) -> None:
-        if not hass.data[DOMAIN][entry.entry_id].get("hb_enabled", True):
+        domain_store = hass.data.get(DOMAIN, {})
+        store_entry = domain_store.get(entry.entry_id)
+        if not store_entry:
+            _LOGGER.debug(
+                "No store for entry %s; skipping GLT heartbeat", entry.entry_id
+            )
             return
-        cur_pin = hass.data[DOMAIN][entry.entry_id].get("glt_pin", "")
-        if not cur_pin:
-            return
-        try:
-            await hass.async_add_executor_job(client.write_glt_pin, cur_pin)
-            _LOGGER.debug("GLT heartbeat successfull")
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("GLT heartbeat failed: %s", err)
 
-    # schedule heartbeat
-    unsub_hb = async_track_time_interval(hass, _heartbeat_cb, timedelta(seconds=5))
+        if not store_entry.get("hb_enabled", True):
+            _LOGGER.debug("GLT heartbeat disabled; skipping scheduled run")
+            return
+
+        pin_str = str(store_entry.get("glt_pin", "")).strip()
+        if not pin_str:
+            _LOGGER.info("Skipping GLT heartbeat because no PIN is configured")
+            return
+        if not pin_str.isdigit():
+            _LOGGER.warning(
+                "Skipping GLT heartbeat because PIN '%s' is not numeric", pin_str
+            )
+            return
+
+        try:
+            pin_int = int(pin_str, 10)
+        except ValueError as err:
+            _LOGGER.warning("Skipping GLT heartbeat: %s", err)
+            return
+
+        try:
+            await hass.async_add_executor_job(client.heartbeat, pin_int)
+            _LOGGER.info("Scheduled GLT heartbeat sent (PIN=%s)", pin_str)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Scheduled GLT heartbeat failed: %s", err)
+
+    # schedule heartbeat using configured interval
+    unsub_hb = async_track_time_interval(
+        hass, _heartbeat_cb, timedelta(seconds=hb_every_s)
+    )
     entry.async_on_unload(unsub_hb)
-    entry.async_on_unload(lambda: client.close())
+    entry.async_on_unload(client.close)
 
     # reload platforms when options change
     entry.async_on_unload(entry.add_update_listener(_options_update_listener))
